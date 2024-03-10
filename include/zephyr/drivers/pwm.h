@@ -368,6 +368,50 @@ struct pwm_dt_spec {
 	PWM_DT_SPEC_GET_OR(DT_DRV_INST(inst), default_value)
 
 /**
+ * @brief Pulses for a single channel for PWM pattern.
+ *
+ * TODO write more
+ */
+struct pwm_pattern_channel_pulses {
+	/** Array of pulse values. */
+	uint32_t *pulse_cycles;
+	/** Channel number. */
+	uint32_t channel;
+	/** Flags. */
+	pwm_flags_t flags;
+};
+
+/**
+ * @brief PWM pattern
+ *
+ * TODO write more.
+ */
+struct pwm_pattern {
+	/** Array of period values. */
+	uint32_t *period_cycles;
+	/** Length of the array. */
+	size_t length;
+	/** Array of channel patterns. */
+	struct pwm_pattern_channel_pulses *channels;
+	/** Length of the channels array. */
+	size_t num_channels;
+};
+
+/**
+ * @brief PWM pattern callback handler function signature
+ *
+ * This handler is called, after the pattern has been successfully completely
+ * send out.
+ *
+ * @note The callback handler will be called in interrupt context.
+ *
+ * @param[in] dev PWM device instance.
+ * @param user_data User data passed to pwm_set_pattern()
+ */
+typedef void (*pwm_pattern_callback_handler_t)(const struct device *dev,
+					       void *user_data);
+
+/**
  * @brief PWM capture callback handler function signature
  *
  * @note The callback handler will be called in interrupt context.
@@ -400,6 +444,15 @@ typedef void (*pwm_capture_callback_handler_t)(const struct device *dev,
 typedef int (*pwm_set_cycles_t)(const struct device *dev, uint32_t channel,
 				uint32_t period_cycles, uint32_t pulse_cycles,
 				pwm_flags_t flags);
+
+/**
+ * @brief PWM driver API call to set PWM pattern output
+ * @see pwm_set_pattern() for argument description.
+ */
+typedef int (*pwm_set_pattern_t)(const struct device *dev,
+				 const struct pwm_pattern *pattern,
+				 pwm_pattern_callback_handler_t cb,
+				 void *user_data);
 
 /**
  * @brief PWM driver API call to obtain the PWM cycles per second (frequency).
@@ -435,6 +488,7 @@ typedef int (*pwm_disable_capture_t)(const struct device *dev,
 /** @brief PWM driver API definition. */
 __subsystem struct pwm_driver_api {
 	pwm_set_cycles_t set_cycles;
+	pwm_set_pattern_t set_pattern;
 	pwm_get_cycles_per_sec_t get_cycles_per_sec;
 #ifdef CONFIG_PWM_CAPTURE
 	pwm_configure_capture_t configure_capture;
@@ -472,6 +526,7 @@ __subsystem struct pwm_driver_api {
  *
  * @retval 0 If successful.
  * @retval -EINVAL If pulse > period.
+ * @retval -ENOSYS if the interface is not implemented.
  * @retval -errno Negative errno code on failure.
  */
 __syscall int pwm_set_cycles(const struct device *dev, uint32_t channel,
@@ -489,7 +544,47 @@ static inline int z_impl_pwm_set_cycles(const struct device *dev,
 		return -EINVAL;
 	}
 
+	if (api->set_cycles == NULL) {
+		return -ENOSYS;
+	}
+
 	return api->set_cycles(dev, channel, period, pulse, flags);
+}
+
+/**
+ * @brief Set a pattern of of pulses and periods for multiple PWM channels
+ *
+ * // TODO write more
+ *
+ * @param[in] dev PWM device instance.
+ * @param pattern PWM pattern
+ * @param[in] cb Application callback handler function to be called upon
+ *               completion
+ * @param[in] user_data User data to pass to the application callback handler
+ *                      function
+ *
+ * @retval 0 If successful.
+ * @retval -ENOSYS if the interface is not implemented.
+ * @retval -errno Negative errno code on failure.
+ */
+__syscall int pwm_set_pattern(const struct device *dev,
+			      const struct pwm_pattern *pattern,
+			      pwm_pattern_callback_handler_t cb,
+			      void *user_data);
+
+static inline int z_impl_pwm_set_pattern(const struct device *dev,
+					 const struct pwm_pattern *pattern,
+					 pwm_pattern_callback_handler_t cb,
+					 void *user_data)
+{
+	const struct pwm_driver_api *api =
+		(const struct pwm_driver_api *)dev->api;
+
+	if (api->set_pattern == NULL) {
+		return -ENOSYS;
+	}
+
+	return api->set_pattern(dev, pattern, cb, user_data);
 }
 
 /**

@@ -80,6 +80,15 @@ struct pwm_stm32_data {
 	uint32_t tim_clk;
 	/* Reset controller device configuration */
 	const struct reset_dt_spec reset;
+	/** pattern data to currently display. */
+	struct pwm_pattern pattern;
+	/** position in the length of pattern. */
+	size_t pattern_position;
+	/** Callback to call after completion. */
+	pwm_pattern_callback_handler_t callback;
+	/** Data for callback function. */
+	void *user_data;
+
 #ifdef CONFIG_PWM_CAPTURE
 	struct pwm_stm32_capture_data capture;
 #endif /* CONFIG_PWM_CAPTURE */
@@ -92,8 +101,8 @@ struct pwm_stm32_config {
 	uint32_t countermode;
 	struct stm32_pclken pclken;
 	const struct pinctrl_dev_config *pcfg;
-#ifdef CONFIG_PWM_CAPTURE
 	void (*irq_config_func)(const struct device *dev);
+#ifdef CONFIG_PWM_CAPTURE
 	const bool four_channel_capture_support;
 #endif /* CONFIG_PWM_CAPTURE */
 };
@@ -651,7 +660,7 @@ static int pwm_stm32_disable_capture(const struct device *dev, uint32_t channel)
 	return 0;
 }
 
-static void pwm_stm32_isr(const struct device *dev)
+static void pwm_stm32_capture_isr(const struct device *dev)
 {
 	const struct pwm_stm32_config *cfg = dev->config;
 	struct pwm_stm32_data *data = dev->data;
@@ -754,6 +763,91 @@ static void pwm_stm32_isr(const struct device *dev)
 
 #endif /* CONFIG_PWM_CAPTURE */
 
+int pwm_stm32_set_pattern(const struct device *dev,
+			  const struct pwm_pattern *pattern,
+			  pwm_pattern_callback_handler_t cb, void *user_data)
+{
+	struct pwm_stm32_data *data = dev->data;
+	const struct pwm_stm32_config *cfg = dev->config;
+
+	data->user_data = user_data;
+	data->callback = cb;
+	data->pattern_position = 0;
+	data->pattern = *pattern;
+	int err = -1;
+	int i;
+
+	for (i = 0; i < pattern->num_channels; i++) {
+		struct pwm_pattern_channel_pulses *channel =
+			&pattern->channels[i];
+		err = pwm_stm32_set_cycles(
+			dev, channel->channel, pattern->period_cycles[0],
+			channel->pulse_cycles[0], channel->flags);
+		if (err) {
+			break;
+		}
+	}
+	if (err) {
+		for (int ii = 0; ii < i; ii++) {
+			pwm_stm32_set_cycles(dev, pattern->channels[ii].channel,
+					     0, 0, pattern->channels[ii].flags);
+		}
+		return err;
+	}
+	data->pattern_position = 1;
+	LL_TIM_EnableIT_UPDATE(cfg->timer);
+	return 0;
+}
+
+static void pwm_stm32_pattern_isr(const struct device *dev)
+{
+	struct pwm_stm32_data *data = dev->data;
+	const struct pwm_stm32_config *cfg = dev->config;
+
+	if (LL_TIM_IsActiveFlag_UPDATE(cfg->timer)) {
+		LL_TIM_ClearFlag_UPDATE(cfg->timer);
+	} else {
+		return;
+	}
+	if (data->pattern_position >= data->pattern.length) {
+		for (int i = 0; i < data->pattern.num_channels; i++) {
+			pwm_stm32_set_cycles(
+				dev, data->pattern.channels[i].channel, 0, 0,
+				data->pattern.channels[i].flags);
+		}
+		LL_TIM_DisableIT_UPDATE(cfg->timer);
+		if (data->callback) {
+			data->callback(dev, data->user_data);
+		}
+		return;
+	}
+
+	for (int i = 0; i < data->pattern.num_channels; i++) {
+		struct pwm_pattern_channel_pulses *channel =
+			&data->pattern.channels[i];
+		pwm_stm32_set_cycles(
+			dev, channel->channel,
+			data->pattern.period_cycles[data->pattern_position],
+			channel->pulse_cycles[data->pattern_position],
+			channel->flags);
+	}
+	data->pattern_position++;
+}
+
+static void pwm_stm32_isr(const struct device *dev)
+{
+#ifdef CONFIG_PWM_CAPTURE
+	const struct pwm_stm32_config *cfg = dev->config;
+	if (LL_TIM_IsEnabledIT_CC1(cfg->timer) ||
+	    LL_TIM_IsEnabledIT_CC2(cfg->timer) ||
+	    LL_TIM_IsEnabledIT_CC3(cfg->timer) ||
+	    LL_TIM_IsEnabledIT_CC4(cfg->timer)) {
+		return pwm_stm32_capture_isr(dev);
+	}
+#endif /* CONFIG_PWM_CAPTURE */
+	pwm_stm32_pattern_isr(dev);
+}
+
 static int pwm_stm32_get_cycles_per_sec(const struct device *dev,
 					uint32_t channel, uint64_t *cycles)
 {
@@ -767,6 +861,7 @@ static int pwm_stm32_get_cycles_per_sec(const struct device *dev,
 
 static const struct pwm_driver_api pwm_stm32_driver_api = {
 	.set_cycles = pwm_stm32_set_cycles,
+	.set_pattern = pwm_stm32_set_pattern,
 	.get_cycles_per_sec = pwm_stm32_get_cycles_per_sec,
 #ifdef CONFIG_PWM_CAPTURE
 	.configure_capture = pwm_stm32_configure_capture,
@@ -836,16 +931,13 @@ static int pwm_stm32_init(const struct device *dev)
 
 	LL_TIM_EnableCounter(cfg->timer);
 
-#ifdef CONFIG_PWM_CAPTURE
 	cfg->irq_config_func(dev);
-#endif /* CONFIG_PWM_CAPTURE */
 
 	return 0;
 }
 
 #define PWM(index) DT_INST_PARENT(index)
 
-#ifdef CONFIG_PWM_CAPTURE
 #define IRQ_CONNECT_AND_ENABLE_BY_NAME(index, name)				\
 {										\
 	IRQ_CONNECT(DT_IRQ_BY_NAME(PWM(index), name, irq),			\
@@ -870,11 +962,10 @@ static void pwm_stm32_irq_config_func_##index(const struct device *dev)		\
 		(IRQ_CONNECT_AND_ENABLE_DEFAULT(index))				\
 	);									\
 }
+#ifdef CONFIG_PWM_CAPTURE
 #define CAPTURE_INIT(index)                                                                        \
-	.irq_config_func = pwm_stm32_irq_config_func_##index,                                      \
 	.four_channel_capture_support = DT_INST_PROP(index, four_channel_capture_support)
 #else
-#define IRQ_CONFIG_FUNC(index)
 #define CAPTURE_INIT(index)
 #endif /* CONFIG_PWM_CAPTURE */
 
@@ -900,6 +991,7 @@ static void pwm_stm32_irq_config_func_##index(const struct device *dev)		\
 		.countermode = DT_PROP(PWM(index), st_countermode),	       \
 		.pclken = DT_INST_CLK(index, timer),                           \
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(index),		       \
+		.irq_config_func = pwm_stm32_irq_config_func_##index,	       \
 		CAPTURE_INIT(index)					       \
 	};                                                                     \
 									       \

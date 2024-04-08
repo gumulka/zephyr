@@ -458,7 +458,7 @@ details laid out here apply to all architectures except x86, which are
 covered in the `x86 Details`_ section below.
 
 The invocation of :c:macro:`IRQ_CONNECT` will declare an instance of
-struct _isr_list wich is placed in a special .intList section.
+struct _isr_list which is placed in a special .intList section.
 This section is placed in compiled code on precompilation stages only.
 It is meant to be used by Zephyr script to generate interrupt tables
 and is removed from the final build.
@@ -467,7 +467,7 @@ and produce the required output.
 
 The default parser generates C arrays filled with arguments and interrupt
 handlers in a form of addresses directly taken from .intList section entries.
-It works with all the architectures and compillers (with the exception mentioned above).
+It works with all the architectures and compilers (with the exception mentioned above).
 The limitation of this parser is the fact that after the arrays are generated
 it is expected for the code not to relocate.
 Any relocation on this stage may lead to the situation where the entry in the interrupt array
@@ -475,10 +475,10 @@ is no longer pointing to the function that was expected.
 It means that this parser, being more compatible is limiting us from using Link Time Optimization.
 
 The local isr declaration parser uses different approach to construct
-the same arrays at binnary level.
+the same arrays at binary level.
 All the entries to the arrays are declared and defined locally,
 directly in the file where :c:macro:`IRQ_CONNECT` is used.
-They are placed in a section with the unique, synthetized name.
+They are placed in a section with the unique, synthesized name.
 The name of the section is then placed in .intList section and it is used to create linker script
 to properly place the created entry in the right place in the memory.
 This parser is now limited to the supported architectures and toolchains but in reward it keeps

@@ -2,6 +2,7 @@
  * Copyright (c) 2016 Linaro Limited.
  * Copyright (c) 2020 Teslabs Engineering S.L.
  * Copyright (c) 2023 Nobleo Technology
+ * Copyright (c) 2024 Fabian Pflug
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -19,6 +20,12 @@
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
+
+#ifdef CONFIG_PWM_STM32_DMA
+#include <zephyr/drivers/dma/dma_stm32.h>
+#include <zephyr/drivers/dma.h>
+#include <stm32_ll_dma.h>
+#endif /* CONFIG_PWM_STM32_DMA */
 
 #include <zephyr/drivers/clock_control/stm32_clock_control.h>
 #include <zephyr/dt-bindings/pwm/stm32_pwm.h>
@@ -74,6 +81,18 @@ struct pwm_stm32_capture_data {
 
 #endif /*CONFIG_PWM_CAPTURE*/
 
+#ifdef CONFIG_PWM_STM32_DMA
+struct stream {
+	const struct device *dma_dev;
+	uint32_t channel;
+	struct dma_config dma_cfg;
+	struct dma_block_config dma_blk_cfg;
+	uint8_t priority;
+	bool src_addr_increment;
+	bool dst_addr_increment;
+};
+#endif /* CONFIG_PWM_STM32_DMA */
+
 /** PWM data. */
 struct pwm_stm32_data {
 	/** Timer clock (Hz). */
@@ -88,10 +107,17 @@ struct pwm_stm32_data {
 	pwm_pattern_callback_handler_t callback;
 	/** Data for callback function. */
 	void *user_data;
+	/** pointer to the pwm device */
+	const struct device * dev;
 
 #ifdef CONFIG_PWM_CAPTURE
 	struct pwm_stm32_capture_data capture;
 #endif /* CONFIG_PWM_CAPTURE */
+
+#ifdef CONFIG_PWM_STM32_DMA
+	volatile int dma_error;
+	struct stream dma;
+#endif /* CONFIG_PWM_STM32_DMA */
 };
 
 /** PWM configuration. */
@@ -322,15 +348,10 @@ static int get_tim_clk(const struct stm32_pclken *pclken, uint32_t *tim_clk)
 	return 0;
 }
 
-static int pwm_stm32_set_cycles(const struct device *dev, uint32_t channel,
-				uint32_t period_cycles, uint32_t pulse_cycles,
-				pwm_flags_t flags)
+static int pwm_stm32_safety_checks(const struct device *dev, uint32_t channel,
+				uint32_t period_cycles)
 {
 	const struct pwm_stm32_config *cfg = dev->config;
-
-	uint32_t ll_channel;
-	uint32_t current_ll_channel; /* complementary output if used */
-	uint32_t negative_ll_channel;
 
 	if (channel < 1u || channel > TIMER_MAX_CH) {
 		LOG_ERR("Invalid channel (%d)", channel);
@@ -353,6 +374,24 @@ static int pwm_stm32_set_cycles(const struct device *dev, uint32_t channel,
 		return -EBUSY;
 	}
 #endif /* CONFIG_PWM_CAPTURE */
+
+	return 0;
+}
+
+static int pwm_stm32_set_cycles(const struct device *dev, uint32_t channel,
+				uint32_t period_cycles, uint32_t pulse_cycles,
+				pwm_flags_t flags)
+{
+	const struct pwm_stm32_config *cfg = dev->config;
+
+	uint32_t ll_channel;
+	uint32_t current_ll_channel; /* complementary output if used */
+	uint32_t negative_ll_channel;
+
+	int r = pwm_stm32_safety_checks(dev, channel, period_cycles);
+	if(r < 0) {
+		return r;
+	}
 
 	ll_channel = ch2ll[channel - 1u];
 
@@ -464,6 +503,106 @@ static int pwm_stm32_set_cycles(const struct device *dev, uint32_t channel,
 
 	return 0;
 }
+
+
+#ifdef CONFIG_PWM_STM32_DMA
+static int pwm_stm32_dma_configure(const struct device *dev, void* buffer, int buffer_length, int channel)
+{
+
+	struct pwm_stm32_data *data = dev->data;
+	const struct pwm_stm32_config *cfg = dev->config;
+
+	struct dma_block_config *blk_cfg;
+	int ret;
+
+	struct stream *dma = &data->dma;
+
+	blk_cfg = &dma->dma_blk_cfg;
+
+	/* prepare the block */
+	memset(blk_cfg, 0, sizeof(struct dma_block_config));
+	blk_cfg->block_size = sizeof(int32_t) * buffer_length;
+
+	/* Source and destination */
+	blk_cfg->source_address = (uint32_t)buffer;
+	blk_cfg->source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	blk_cfg->source_reload_en = 0;
+
+	switch (channel)
+	{
+	case 1:
+		blk_cfg->dest_address = (uint32_t)&cfg->timer->CCR1;
+		break;
+	case 2:
+		blk_cfg->dest_address = (uint32_t)&cfg->timer->CCR2;
+		break;
+	case 3:
+		blk_cfg->dest_address = (uint32_t)&cfg->timer->CCR3;
+		break;
+	case 4:
+		blk_cfg->dest_address = (uint32_t)&cfg->timer->CCR4;
+		break;
+	default:
+		LOG_ERR("Invalid channel (%d)", channel);
+		return -EINVAL;
+	}
+	blk_cfg->dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	blk_cfg->dest_reload_en = 0;
+
+	/* Manually set the FIFO threshold to 1/4 because the
+	 * dmamux DTS entry does not contain fifo threshold
+	 */
+	blk_cfg->fifo_mode_control = 0;
+
+	/* direction is given by the DT */
+	dma->dma_cfg.head_block = blk_cfg;
+	dma->dma_cfg.user_data = data;
+
+	ret = dma_config(data->dma.dma_dev, data->dma.channel,
+			 &dma->dma_cfg);
+	if (ret != 0) {
+		LOG_ERR("Problem setting up DMA: %d", ret);
+		return ret;
+	}
+
+	data->dma_error = 0;
+
+    /* Enable channel DMA requests */
+	switch (channel)
+	{
+	case 1:
+    	LL_TIM_EnableDMAReq_CC1(cfg->timer);
+		break;
+	case 2:
+    	LL_TIM_EnableDMAReq_CC2(cfg->timer);
+		break;
+	case 3:
+    	LL_TIM_EnableDMAReq_CC3(cfg->timer);
+		break;
+	case 4:
+    	LL_TIM_EnableDMAReq_CC4(cfg->timer);
+		break;
+	default:
+		LOG_ERR("Invalid channel (%d)", channel);
+		return -EINVAL;
+	}
+
+	LOG_DBG("DMA started");
+
+	return ret;
+}
+
+
+static void dma_callback(const struct device *dev, void *user_data,
+			 uint32_t channel, int status)
+{
+	struct pwm_stm32_data *data = user_data;
+	if(data->callback) {
+		data->callback(data->dev, data->user_data);
+	}
+}
+#endif /* CONFIG_PWM_STM32_DMA */
+
 
 #ifdef CONFIG_PWM_CAPTURE
 static int init_capture_channels(const struct device *dev, uint32_t channel,
@@ -774,6 +913,60 @@ int pwm_stm32_set_pattern(const struct device *dev,
 	data->callback = cb;
 	data->pattern_position = 0;
 	data->pattern = *pattern;
+
+#ifdef CONFIG_PWM_STM32_DMA
+	if (data->dma.dma_dev != NULL) {
+		int ret;
+		ret = pwm_stm32_safety_checks(dev, pattern->channels[0].channel, pattern->period_cycles[0]);
+		if(ret < 0) {
+			LOG_ERR("Could not set up cycles for PWM.");
+			return ret;
+		}
+
+		// TODO Something is wrong here.
+		// I sometimes lose the first pulse on output, but is is not deterministic.
+		// It is not just the first pulse, it seems, as if the DMA is not fast
+		// enough and sometimes skips an output and in turn shows the last
+		// output again instead of updating. It is just most prominent for the
+		// first, because then one bit is missing for everything.
+
+		ret = pwm_stm32_dma_configure(dev, pattern->channels[0].pulse_cycles, pattern->length, pattern->channels[0].channel);
+		if (ret < 0) {
+			LOG_ERR("Problem configuring DMA");
+			return ret;
+		}
+
+		uint32_t ll_channel = ch2ll[pattern->channels[0].channel - 1u];
+		uint32_t period_cycles = pattern->period_cycles[0] - 1;
+		LL_TIM_OC_InitTypeDef oc_init;
+
+		LL_TIM_OC_StructInit(&oc_init);
+
+		oc_init.OCMode = LL_TIM_OCMODE_PWM1;
+		oc_init.OCState = LL_TIM_OCSTATE_ENABLE;
+		oc_init.OCPolarity = get_polarity(pattern->channels[0].flags);
+		oc_init.CompareValue = 0;
+
+		/* in LL_TIM_OC_Init, the channel is always the non-complementary */
+		if (LL_TIM_OC_Init(cfg->timer, ll_channel, &oc_init) != SUCCESS) {
+			LOG_ERR("Could not initialize timer channel output");
+			return -EIO;
+		}
+		LL_TIM_DisableARRPreload(cfg->timer);
+		ret = dma_start(data->dma.dma_dev, data->dma.channel);
+		if (ret != 0) {
+			LOG_ERR("Problem starting DMA: %d", ret);
+			return ret;
+		}
+		LL_TIM_OC_EnablePreload(cfg->timer, ll_channel);
+		LL_TIM_SetAutoReload(cfg->timer, period_cycles);
+
+		return ret;
+	}
+#endif /* CONFIG_PWM_STM32_DMA */
+
+	LOG_INF("Using non-dma method for pattern.");
+
 	int err = -1;
 	int i;
 
@@ -874,6 +1067,7 @@ static int pwm_stm32_init(const struct device *dev)
 {
 	struct pwm_stm32_data *data = dev->data;
 	const struct pwm_stm32_config *cfg = dev->config;
+	data->dev = dev;
 
 	int r;
 	const struct device *clk;
@@ -908,6 +1102,14 @@ static int pwm_stm32_init(const struct device *dev)
 		LOG_ERR("PWM pinctrl setup failed (%d)", r);
 		return r;
 	}
+
+#ifdef CONFIG_PWM_STM32_DMA
+	if ((data->dma.dma_dev != NULL) &&
+	    !device_is_ready(data->dma.dma_dev)) {
+		LOG_ERR("%s device not ready", data->dma.dma_dev->name);
+		return -ENODEV;
+	}
+#endif /* CONFIG_PWM_STM32_DMA */
 
 	/* initialize timer */
 	LL_TIM_StructInit(&init);
@@ -976,9 +1178,41 @@ static void pwm_stm32_irq_config_func_##index(const struct device *dev)		\
 	}
 
 
+#if defined(CONFIG_PWM_STM32_DMA)
+
+#define PWM_DMA_CHANNEL_INIT(index)							\
+	.dma = {									\
+		.dma_dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_IDX(index, 0)),		\
+		.channel = STM32_DMA_SLOT_BY_IDX(index, 0, channel),			\
+		.dma_cfg = {								\
+			.dma_slot = STM32_DMA_SLOT_BY_IDX(index, 0, slot),		\
+			.channel_direction = STM32_DMA_CONFIG_DIRECTION(		\
+				STM32_DMA_CHANNEL_CONFIG_BY_IDX(index, 0)),		\
+			.source_data_size = STM32_DMA_CONFIG_PERIPHERAL_DATA_SIZE(	\
+				STM32_DMA_CHANNEL_CONFIG_BY_IDX(index, 0)),		\
+			.dest_data_size = STM32_DMA_CONFIG_MEMORY_DATA_SIZE(		\
+				STM32_DMA_CHANNEL_CONFIG_BY_IDX(index, 0)),		\
+			.source_burst_length = 1,       /* SINGLE transfer */		\
+			.dest_burst_length = 1,         /* SINGLE transfer */		\
+			.channel_priority = STM32_DMA_CONFIG_PRIORITY(			\
+				STM32_DMA_CHANNEL_CONFIG_BY_IDX(index, 0)),		\
+			.dma_callback = dma_callback,					\
+			.block_count = 2,						\
+		},									\
+		.src_addr_increment = STM32_DMA_CONFIG_PERIPHERAL_ADDR_INC(		\
+			STM32_DMA_CHANNEL_CONFIG_BY_IDX(index, 0)),			\
+		.dst_addr_increment = STM32_DMA_CONFIG_MEMORY_ADDR_INC(			\
+			STM32_DMA_CHANNEL_CONFIG_BY_IDX(index, 0)),			\
+	}
+
+#endif /* CONFIG_PWM_STM32_DMA */
+
 #define PWM_DEVICE_INIT(index)                                                 \
 	static struct pwm_stm32_data pwm_stm32_data_##index = {		       \
 		.reset = RESET_DT_SPEC_GET(PWM(index)),			       \
+		COND_CODE_1(DT_INST_DMAS_HAS_IDX(index, 0),		       \
+			(PWM_DMA_CHANNEL_INIT(index)),			       \
+			(/* Required for other pwm instances without dma */))  \
 	};								       \
 									       \
 	IRQ_CONFIG_FUNC(index)						       \

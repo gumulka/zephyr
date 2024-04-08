@@ -1,6 +1,7 @@
 # STM32 PWM configuration options
 
 # Copyright (c) 2016 Linaro Limited.
+# Copyright (c) 2024 Fabian Pflug
 # SPDX-License-Identifier: Apache-2.0
 
 config PWM_STM32
@@ -14,3 +15,14 @@ config PWM_STM32
 	  This option enables the PWM driver for STM32 family of
 	  processors. Say y if you wish to use PWM port on STM32
 	  MCU.
+
+if PWM_STM32
+
+config PWM_STM32_DMA
+	bool "STM32 MCU PWM DMA Support"
+	select DMA
+	help
+	  Enable the PWM DMA mode for PWM instances
+	  that enable dma channels in their device tree node.
+
+endif

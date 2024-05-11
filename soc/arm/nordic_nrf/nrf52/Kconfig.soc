@@ -147,4 +147,14 @@ config NRF52_ANOMALY_109_WORKAROUND
 	  64MHz clock at the same time as the peripheral that is using DMA is started.
 	  This anomaly applies to IC revisions up to "3", the most recent one.
 
+config NRF52_ANOMALY_89_WORKAROUND
+	bool "Anomaly 89 workaround"
+	default y
+	depends on SOC_NRF52832
+	depends on NRFX_TWIM
+	depends on NRFX_GPIOTE
+	help
+	  This helps in reducing the 400uA to 450uA static current consumption when
+	  GPIOTE and TWIM is enabled.
+
 endif # SOC_SERIES_NRF52X

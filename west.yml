@@ -21,6 +21,8 @@ manifest:
   remotes:
     - name: upstream
       url-base: https://github.com/zephyrproject-rtos
+    - name: gumulka
+      url-base: https://github.com/gumulka
     - name: babblesim
       url-base: https://github.com/BabbleSim
 
@@ -186,7 +188,8 @@ manifest:
       groups:
         - hal
     - name: hal_nordic
-      revision: d054a315eb888ba70e09e5f6decd4097b0276d1f
+      revision: 8dfbaeeded40dcea633ce9e2b60e821374637ca0
+      remote: gumulka
       path: modules/hal/nordic
       groups:
         - hal

@@ -370,6 +370,18 @@ struct pwm_dt_spec {
 	PWM_DT_SPEC_GET_OR(DT_DRV_INST(inst), default_value)
 
 /**
+ * @brief PWM pattern callback handler function signature
+ *
+ * This handler is called, after the pattern has been successfully completely send out.
+ *
+ * @note The callback handler will be called in interrupt context.
+ *
+ * @param[in] dev PWM device instance.
+ * @param user_data User data passed to pwm_set_pattern()
+ */
+typedef void (*pwm_pattern_callback_handler_t)(const struct device *dev, void *user_data);
+
+/**
  * @brief PWM capture callback handler function signature
  *
  * @note The callback handler will be called in interrupt context.
@@ -402,6 +414,15 @@ typedef void (*pwm_capture_callback_handler_t)(const struct device *dev,
 typedef int (*pwm_set_cycles_t)(const struct device *dev, uint32_t channel,
 				uint32_t period_cycles, uint32_t pulse_cycles,
 				pwm_flags_t flags);
+
+/**
+ * @brief PWM driver API call to set PWM pattern output
+ * @see pwm_set_pattern() for argument description.
+ */
+typedef int (*pwm_set_pattern_t)(const struct device *dev, uint32_t channel,
+				 uint32_t *period_cycles, uint32_t *pulse_cycles, size_t num_cycles,
+				 pwm_flags_t flags, pwm_pattern_callback_handler_t cb,
+				 void *user_data);
 
 /**
  * @brief PWM driver API call to obtain the PWM cycles per second (frequency).
@@ -437,6 +458,7 @@ typedef int (*pwm_disable_capture_t)(const struct device *dev,
 /** @brief PWM driver API definition. */
 __subsystem struct pwm_driver_api {
 	pwm_set_cycles_t set_cycles;
+	pwm_set_pattern_t set_pattern;
 	pwm_get_cycles_per_sec_t get_cycles_per_sec;
 #ifdef CONFIG_PWM_CAPTURE
 	pwm_configure_capture_t configure_capture;
@@ -492,6 +514,56 @@ static inline int z_impl_pwm_set_cycles(const struct device *dev,
 	}
 
 	return api->set_cycles(dev, channel, period, pulse, flags);
+}
+
+/**
+ * @brief Set a non-repeating pattern of pulses and periods for a single PWM channel.
+ *
+ * Set a pattern of pwm pulses and periods on the pwm. Each pulse and period pair will be set once
+ * on the pwm and then replaced by the next. This call will not block for the pattern to be
+ * completed, use the callback function to be notified for it.
+ *
+ * Behaviour after the pattern is undefined. It could either be a repetition of the last value of
+ * the patter or no output. Use the callback function to immediately set a new pattern or pwm.
+ *
+ * @note Some multi-channel PWM controllers share the PWM period across all channels. Depending on
+ * the hardware, changing the PWM period for one channel may affect the PWM period for the other
+ * channels of the same PWM controller.
+ *
+ * @note This API function cannot be invoked from user space due to the use of a function callback.
+ * In user space, the non pattern function must be used (pwm_set_cycles()) instead.
+ *
+ * @param[in] dev PWM device instance.
+ * @param channel PWM channel.
+ * @param periods Array of periods (in clock cycles) set to the PWM. HW specific.
+ * @param pulses  Array of pulse widths (in clock cycles) set to the PWM. HW specific.
+ * @param num_pulses Number of entries in the two arrays.
+ * @param flags Flags for pin configuration.
+ * @param[in] cb Application callback handler function to be called upon
+ *               completion
+ * @param[in] user_data User data to pass to the application callback handler
+ *                      function
+ *
+ * @retval 0 If successful.
+ * @retval -ENOSYS if the interface is not implemented.
+ * @retval -errno Negative errno code on failure.
+ */
+__syscall int pwm_set_pattern(const struct device *dev, uint32_t channel, uint32_t *periods,
+			      uint32_t *pulses, size_t num_pulses, pwm_flags_t flags,
+			      pwm_pattern_callback_handler_t cb, void *user_data);
+
+static inline int z_impl_pwm_set_pattern(const struct device *dev, uint32_t channel,
+					 uint32_t *periods, uint32_t *pulses, size_t num_pulses,
+					 pwm_flags_t flags, pwm_pattern_callback_handler_t cb,
+					 void *user_data)
+{
+	const struct pwm_driver_api *api = (const struct pwm_driver_api *)dev->api;
+
+	if (api->set_pattern == NULL) {
+		return -ENOSYS;
+	}
+
+	return api->set_pattern(dev, channel, periods, pulses, num_pulses, flags, cb, user_data);
 }
 
 /**

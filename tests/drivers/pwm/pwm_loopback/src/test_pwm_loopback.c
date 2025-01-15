@@ -329,3 +329,157 @@ ZTEST(pwm_loopback, test_capture_busy)
 	err = pwm_disable_capture(in.dev, in.pwm);
 	zassert_equal(err, 0, "failed to disable pwm capture (err %d)", err);
 }
+
+#if !PWM_LOOPBACK_DROPS_FRAMES
+static void pattern_capture_callback(const struct device *dev, uint32_t pwm,
+				     uint32_t period_cycles,
+				     uint32_t pulse_cycles, int status,
+				     void *user_data)
+{
+	struct test_pwm_pattern_data *data = user_data;
+
+	if (data->count >= data->buffer_len) {
+		/* Safe guard in case capture is not disabled */
+		return;
+	}
+	if (status) {
+		TC_PRINT("Capture_callback error: %d", status);
+		return;
+	}
+	if (data->discard_capture) {
+		data->discard_capture = false;
+		return;
+	}
+
+	data->pulses[data->count] = pulse_cycles;
+	data->periods[data->count] = period_cycles;
+	data->count++;
+}
+
+static void pattern_complete_callback(const struct device *dev, void *user_data)
+{
+	struct k_sem *sem = user_data;
+	k_sem_give(sem);
+}
+
+#define NUM_SAMPLES 10
+
+ZTEST(pwm_loopback, test_set_pattern)
+{
+	struct test_pwm in;
+	struct test_pwm out;
+	uint32_t periods_in[NUM_SAMPLES], pulses_in[NUM_SAMPLES],
+		periods_out[NUM_SAMPLES], pulses_out[NUM_SAMPLES];
+	uint64_t periods_usec[NUM_SAMPLES], pulses_usec[NUM_SAMPLES];
+	struct k_sem sem;
+	struct test_pwm_pattern_data data_in = {
+		.periods = periods_in,
+		.pulses = pulses_in,
+		.buffer_len = NUM_SAMPLES,
+		.count = 0,
+	};
+	uint64_t usec = 0;
+	uint64_t total_usec;
+	uint64_t cycles_per_sec;
+	int err;
+	int i;
+
+	get_test_pwms(&out, &in);
+
+	memset(periods_in, 0, sizeof(periods_in));
+	memset(pulses_in, 0, sizeof(pulses_in));
+
+	k_sem_init(&sem, 0, 1);
+
+	/* disable pwm. */
+	err = pwm_set(out.dev, out.pwm, 0, 0, out.flags);
+	zassert_equal(err, 0, "failed to set pwm output (err %d)", err);
+
+	err = pwm_configure_capture(in.dev, in.pwm,
+				    in.flags | PWM_CAPTURE_MODE_CONTINUOUS |
+					    PWM_CAPTURE_TYPE_BOTH,
+				    pattern_capture_callback, &data_in);
+	if (err == -ENOTSUP) {
+		TC_PRINT("Capture of pulse and period at the same time not "
+			 "supported. Skipping test\n");
+		return;
+	}
+
+	err = pwm_enable_capture(in.dev, in.pwm);
+	zassert_equal(err, 0, "failed to enable pwm capture (err %d)", err);
+
+	/* set some changing values for period and pulse. */
+	for (i = 0; i < NUM_SAMPLES; i++) {
+		periods_usec[i] = (i + 1) * 1200;
+		pulses_usec[i] = (i + 1) * 400;
+	}
+	/* set the last sample to 0, so that we have a clean ending.*/
+	periods_usec[NUM_SAMPLES - 1] = 0;
+	pulses_usec[NUM_SAMPLES - 1] = 0;
+
+	/* convert from usec to cycles. */
+	pwm_get_cycles_per_sec(out.dev, out.pwm, &cycles_per_sec);
+	total_usec = 0;
+	for (i = 0; i < NUM_SAMPLES; i++) {
+		periods_out[i] = (periods_usec[i] * cycles_per_sec /
+				  (uint64_t)USEC_PER_SEC);
+		pulses_out[i] = (pulses_usec[i] * cycles_per_sec /
+				 (uint64_t)USEC_PER_SEC);
+
+		total_usec += periods_usec[i];
+	}
+
+#if PWM_LOOPBACK_SKIP_FIRST_CAPTURE
+	/* start the pattern. */
+	err = pwm_set_pattern(out.dev, out.pwm, periods_out, pulses_out,
+			      NUM_SAMPLES, out.flags, pattern_complete_callback,
+			      &sem);
+	if (err == -ENOSYS) {
+		TC_PRINT("Pattern not supported. Skipping test\n");
+		pwm_disable_capture(in.dev, in.pwm);
+		return;
+	}
+	zassert_equal(err, 0, "failed to set pattern (err %d)", err);
+	err = k_sem_take(&sem, K_USEC(total_usec * 10));
+
+	/* We discard the first pattern iteration, because some drivers discard
+	 * the first few samples in their capture and compare logic.*/
+	data_in.count = 0;
+	/* ignore the first capture now, as it it the long trail from the last
+	 * pattern.*/
+	data_in.discard_capture = true;
+#endif
+
+	/* start the pattern again */
+	err = pwm_set_pattern(out.dev, out.pwm, periods_out, pulses_out,
+			      NUM_SAMPLES, out.flags, pattern_complete_callback,
+			      &sem);
+	zassert_equal(err, 0, "failed to set pattern (err %d)", err);
+
+	err = k_sem_take(&sem, K_USEC(total_usec * 10));
+	zassert_equal(err, 0, "pwm capture timed out (err %d)", err);
+
+	err = pwm_disable_capture(in.dev, in.pwm);
+	zassert_equal(err, 0, "failed to disable pwm capture (err %d)", err);
+
+	zassert_equal(data_in.count, NUM_SAMPLES - 2, "Did not capture enough samples!");
+
+	for (i = 0; i < data_in.count; i++) {
+		/* convert everything to usec, as the counters for capture and
+		 * send could be different. */
+		err = pwm_cycles_to_usec(in.dev, in.pwm, periods_in[i], &usec);
+		zassert_equal(err, 0, "failed to calculate usec (err %d)", err);
+		zassert_within(usec, periods_usec[i], periods_usec[i] / 100,
+			       "period %d capture off by more than 1 percent "
+			       "%lld vs %lld",
+			       i, periods_usec[i], usec);
+
+		err = pwm_cycles_to_usec(in.dev, in.pwm, pulses_in[i], &usec);
+		zassert_equal(err, 0, "failed to calculate usec (err %d)", err);
+		zassert_within(usec, pulses_usec[i], pulses_usec[i] / 100,
+			       "pulse %d capture off by more than 1 percent "
+			       "%lld vs %lld",
+			       i, pulses_usec[i], usec);
+	}
+}
+#endif // !PWM_LOOPBACK_DROPS_FRAMES

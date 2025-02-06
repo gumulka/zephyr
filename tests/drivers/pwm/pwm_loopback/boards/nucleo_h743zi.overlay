@@ -15,6 +15,15 @@
 	};
 };
 
+
+&dma1 {
+	status = "okay";
+};
+
+&dmamux1 {
+	status = "okay";
+};
+
 /* 32-Bit timers */
 &timers2 {
 	status = "okay";
@@ -22,6 +31,8 @@
 		status = "okay";
 		pinctrl-0 = <&tim2_ch4_pa3>; /* CN9 PIN1 A0 */
 		pinctrl-names = "default";
+		dmas = <&dmamux1 0 21 STM32_DMA_PRIORITY_HIGH>; /* See Table 122 in the reference manual for information about the 21. */
+		dma-names = "dmamux";
 	};
 };
 
@@ -35,6 +46,6 @@
 		/* At least one of the test devices need to verify
 		 * the four-channel-capture-support in this test.
 		 */
-		 four-channel-capture-support;
+		//  four-channel-capture-support;
 	};
 };

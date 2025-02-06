@@ -439,8 +439,9 @@ ZTEST(pwm_loopback, test_set_pattern)
 		pwm_disable_capture(in.dev, in.pwm);
 		return;
 	}
-	zassert_equal(err, 0, "failed to set pattern (err %d)", err);
+	zassert_equal(err, 0, "failed to set first pattern (err %d)", err);
 	err = k_sem_take(&sem, K_USEC(total_usec * 10));
+	zassert_equal(err, 0, "failed to receive semaphore (err %d)", err);
 
 	/* We discard the first pattern iteration, because some drivers discard
 	 * the first few samples in their capture and compare logic.*/
@@ -454,13 +455,22 @@ ZTEST(pwm_loopback, test_set_pattern)
 	err = pwm_set_pattern(out.dev, out.pwm, periods_out, pulses_out,
 			      NUM_SAMPLES, out.flags, pattern_complete_callback,
 			      &sem);
-	zassert_equal(err, 0, "failed to set pattern (err %d)", err);
+	zassert_equal(err, 0, "failed to set second pattern (err %d)", err);
 
 	err = k_sem_take(&sem, K_USEC(total_usec * 10));
 	zassert_equal(err, 0, "pwm capture timed out (err %d)", err);
 
 	err = pwm_disable_capture(in.dev, in.pwm);
 	zassert_equal(err, 0, "failed to disable pwm capture (err %d)", err);
+
+	printf("captured samples: %d\n", data_in.count);
+
+	for (i = 0; i < data_in.count; i++) {
+		uint64_t period, pulse;
+		pwm_cycles_to_usec(in.dev, in.pwm, periods_in[i], &period);
+		pwm_cycles_to_usec(in.dev, in.pwm, pulses_in[i], &pulse);
+		printf("%d: %lld/%lld\n", i, period, pulse);
+	}
 
 	zassert_equal(data_in.count, NUM_SAMPLES - 2, "Did not capture enough samples!");
 
